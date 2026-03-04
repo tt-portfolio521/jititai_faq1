@@ -1,0 +1,22 @@
+# データファイル
+*.xlsx
+*.xls
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 生成データフォルダ
+faq_data/
+faq_data2/
+faq_data_max/
+analysis_results/
+
+# 環境変数
+.env
+
+# デバッグ用生レスポンス
+*_raw.txt
+municipalities.json
