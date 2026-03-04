@@ -19,6 +19,11 @@
   pip install pandas openpyxl numpy scikit-learn aiohttp
 """
 
+from __future__ import annotations
+
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import re
 import sys

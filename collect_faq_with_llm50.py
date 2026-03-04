@@ -12,6 +12,10 @@ LLMガイド付きFAQ収集スクリプト（改良版）
 
 import json
 import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
 import re
 import time
 import argparse
