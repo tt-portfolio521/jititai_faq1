@@ -41,8 +41,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 GEMINI_MODEL = "gemini-embedding-001"
 
 # MMR パラメータ
-DEFAULT_MMR_LAMBDA = 0.7
-DEFAULT_MMR_SCORE_THRESHOLD = -0.3
+DEFAULT_MMR_LAMBDA = 0.3
+DEFAULT_MMR_SCORE_THRESHOLD = -0.5
 DEFAULT_MMR_MAX_RATIO = 0.3
 
 # Gemini API 並列処理パラメータ
@@ -78,21 +78,46 @@ EXTRA_CITY_NAMES = {
 def is_city_specific(question: str, city_name: str) -> bool:
     """質問が特定の自治体固有の内容かどうかを判定"""
     q = question.strip()
-
-    # 「○○市立」「○○市営」など施設固有パターンを検出
-    #    「○○市に転入」のような汎用的な質問は除外しない
     all_city_names = EXTRA_CITY_NAMES | {city_name}
+
+    # 自治体名（○○市）が含まれていれば除外
     for cn in all_city_names:
         if cn in q:
-            specific_patterns = [
-                cn + "立", cn + "営", cn + "民",
-                cn + "バス", cn + "図書館",
-            ]
-            for pat in specific_patterns:
-                if pat in q:
-                    return True
+            return True
+
+    # 「市」なしの駅名パターン（「札幌駅」「仙台駅」等）
+    for cn in all_city_names:
+        base = re.sub(r'[市町村区]$', '', cn)
+        if base and len(base) >= 2 and base + "駅" in q:
+            return True
+
+    # 広報紙名（「広報かまくら」「広報さっぽろ」等）
+    if re.search(r'広報[ぁ-んァ-ン一-鿿]{2,}', q):
+        return True
+    # 「市政だより」「市民の友」等の固有広報紙名
+    if re.search(r'(市政だより|市民の友|掲示板)', q):
+        return True
 
     return False
+
+
+def strip_city_names(text: str, city_name: str = "") -> str:
+    """質問文から自治体名を除去してEmbedding精度を向上させる。
+
+    例:
+      "広報さいたま市が届かない" → "広報が届かない"
+      "さいたま市のがん検診の費用" → "がん検診の費用"
+    """
+    all_names = EXTRA_CITY_NAMES | ({city_name} if city_name else set())
+    for cn in sorted(all_names, key=len, reverse=True):
+        if cn and cn in text:
+            text = text.replace(cn, "")
+    # 広報紙の固有名も汎用化（「広報かまくら」→「広報」）
+    text = re.sub(r'(広報)[ぁ-んァ-ン]{2,}', r'\1', text)
+    text = re.sub(r'(広報紙)[「」ぁ-んァ-ン]+[「」]?', r'\1', text)
+    text = re.sub(r'^[のはがをにへでと、]+', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 # ============================================================
@@ -290,6 +315,22 @@ def clean_question(text: str) -> str:
     text = re.sub(r'[　\s]+', ' ', text).strip()
     text = re.sub(r'^Q[\.:：\s]*', '', text)
     text = re.sub(r'[？?]+$', '', text).strip()
+    return text
+
+
+def strip_city_names(text: str, city_name: str = "") -> str:
+    """質問文から自治体名を除去してEmbedding精度を向上させる。
+
+    例:
+      "広報さいたま市が届かない" → "広報が届かない"
+      "さいたま市のがん検診の費用と受け方" → "がん検診の費用と受け方"
+    """
+    all_names = EXTRA_CITY_NAMES | ({city_name} if city_name else set())
+    for cn in sorted(all_names, key=len, reverse=True):
+        if cn and cn in text:
+            text = text.replace(cn, "")
+    text = re.sub(r'^[のはがをにへでと、]+', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 
@@ -578,14 +619,26 @@ def main():
     print("\n【STEP 2】テキスト正規化")
     df["質問_clean"] = df["質問"].apply(clean_question)
     df["回答"] = df["回答"].apply(clean_answer)
+
+    # Embedding用: 自治体名を除去（「広報○○市」→「広報」で統一）
+    df["質問_embed"] = df.apply(
+        lambda row: strip_city_names(row["質問_clean"], row.get("自治体", "")),
+        axis=1,
+    )
+    n_changed = len(df[df["質問_clean"] != df["質問_embed"]])
+    if n_changed > 0:
+        print(f"  自治体名除去: {n_changed}件が変更")
+        for _, row in df[df["質問_clean"] != df["質問_embed"]].head(3).iterrows():
+            print(f"    {row['質問_clean'][:35]} → {row['質問_embed'][:35]}")
+
     before = len(df)
-    df = df.drop_duplicates(subset=["質問_clean"], keep="first").reset_index(drop=True)
+    df = df.drop_duplicates(subset=["質問_embed"], keep="first").reset_index(drop=True)
     print(f"  完全一致除去: {before} → {len(df)}件（{before-len(df)}件除去）")
 
     # ③ Embedding
     print("\n【STEP 3】Gemini Embedding（非同期並列処理）")
     embeddings = embed_with_gemini(
-        df["質問_clean"].tolist(),
+        df["質問_embed"].tolist(),
         api_key,
         batch_size=args.batch_size,
         max_concurrent=args.max_concurrent,
@@ -607,9 +660,58 @@ def main():
         print(f"  {cat}: {len(idxs)}件 → {len(sel)}件")
 
     result = df.loc[selected_indices].reset_index(drop=True)
+    result_emb = embeddings[selected_indices]
     total_before, total_after = len(df), len(result)
     print(f"\n合計: {total_before}件 → {total_after}件"
           f"（{total_after/total_before*100:.1f}%）")
+
+    # ④-2 カテゴリ間の重複除去
+    print("\n【STEP 4-2】カテゴリ間の重複質問を除去")
+    sim = cosine_similarity(result_emb)
+    np.fill_diagonal(sim, 0)
+
+    removed = set()
+    cross_dup_log = []
+    CROSS_DEDUP_THRESHOLD = 0.95
+
+    for i in range(len(result)):
+        if i in removed:
+            continue
+        for j in range(i + 1, len(result)):
+            if j in removed:
+                continue
+            # 同じカテゴリ内はMMRで処理済みなのでスキップ
+            if result.iloc[i]["統一カテゴリ"] == result.iloc[j]["統一カテゴリ"]:
+                continue
+            if sim[i, j] >= CROSS_DEDUP_THRESHOLD:
+                removed.add(j)
+                cross_dup_log.append((
+                    result.iloc[j]["質問"][:50],
+                    result.iloc[j]["統一カテゴリ"],
+                    result.iloc[i]["質問"][:50],
+                    result.iloc[i]["統一カテゴリ"],
+                    sim[i, j],
+                ))
+
+    if cross_dup_log:
+        print(f"  {len(cross_dup_log)}件の重複を除去（閾値={CROSS_DEDUP_THRESHOLD}）:")
+        for q_rm, cat_rm, q_kp, cat_kp, s in cross_dup_log[:10]:
+            print(f"    除去: [{cat_rm}] {q_rm}")
+            print(f"    残す: [{cat_kp}] {q_kp} (類似度={s:.3f})")
+        if len(cross_dup_log) > 10:
+            print(f"    ... 他{len(cross_dup_log) - 10}件")
+
+        keep_mask = [i for i in range(len(result)) if i not in removed]
+        result = result.iloc[keep_mask].reset_index(drop=True)
+
+        # statsを更新
+        for cat in stats:
+            stats[cat]["after"] = len(result[result["統一カテゴリ"] == cat])
+
+        print(f"  {total_after}件 → {len(result)}件")
+        total_after = len(result)
+    else:
+        print("  カテゴリ間の重複なし")
 
     # ⑤ 出力
     print("\n【STEP 5】Excel出力")

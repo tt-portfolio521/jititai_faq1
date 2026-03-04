@@ -20,3 +20,7 @@ analysis_results/
 # デバッグ用生レスポンス
 *_raw.txt
 municipalities.json
+
+# 追加推奨
+.gemini/
+dedup_diagnosis.txt
