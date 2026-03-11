@@ -98,6 +98,44 @@ def is_city_specific(question: str, city_name: str) -> bool:
     if re.search(r'(市政だより|市民の友|掲示板)', q):
         return True
 
+    # 時限的イベント・事業（年号＋固有名、閉館・終了等）
+    if re.search(r'(20\d{2}|令和\d)[年度]*.*(?:大会|フェス|祭|イベント|博覧会|万博)', q):
+        return True
+    if re.search(r'(?:閉館|閉鎖|閉園|廃止|終了).*(?:について|教えて)', q):
+        return True
+
+    return False
+
+
+def is_invalid_question(question: str) -> bool:
+    """質問として成立していない無効なテキストを判定する。
+
+    短すぎる文、外国語、単語のみ、見出し等を除外する。
+    """
+    q = question.strip()
+
+    # 空・極短（8文字未満）
+    if len(q) < 8:
+        return True
+
+    # 外国語のみ（英語、中国語等）
+    if re.match(r'^[a-zA-Z\s\-\.,:;!?\'\"]+$', q):
+        return True
+    if re.match(r'^[简繁体中文]+$', q):
+        return True
+    # 「English」「简体中文」「한국어」等の言語名
+    if re.match(r'^(English|简体中文|繁體中文|한국어|Tiếng Việt|Português)$', q, re.IGNORECASE):
+        return True
+
+    # 「よくある質問」「FAQ」等のページタイトル
+    if re.match(r'^(よくある質問|FAQ|ＦＡＱ|Q&A|お問い合わせ|ホーム)$', q):
+        return True
+
+    # 疑問形でもなく、短い名詞句のみ（質問になっていない）
+    # 例: 「高度地区」「さんかく岡山」「家庭系ごみの有料化」
+    if len(q) < 15 and not re.search(r'[？?]|か[。.]?$|たい|ほしい|ですが|のですが|けど|して|どう', q):
+        return True
+
     return False
 
 
@@ -133,6 +171,9 @@ UNIFIED_CATEGORIES = [
 
 # LLM分類結果のキャッシュ（同じシート名の再分類を防止してAPI節約）
 _sheet_category_cache: dict[str, str] = {}
+
+# 質問単位の分類キャッシュ
+_question_category_cache: dict[str, str] = {}
 
 
 def classify_sheet_with_gemini(sheet_name: str, sample_questions: list[str],
@@ -182,7 +223,7 @@ def classify_sheet_with_gemini(sheet_name: str, sample_questions: list[str],
 
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
-            model="gemini-3-flash-preview",
+            model="gemini-3.1-flash-lite-preview",
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
@@ -211,6 +252,118 @@ def classify_sheet_with_gemini(sheet_name: str, sample_questions: list[str],
         print(f"  [ERROR] LLM分類失敗 '{sheet_name}': {e} → 'その他'")
         _sheet_category_cache[sheet_name] = "その他"
         return "その他"
+
+
+def classify_questions_batch(questions: list[str], api_key: str,
+                              batch_size: int = 30) -> list[str]:
+    """複数の質問を一括でカテゴリ分類する（多ジャンル混在シート用）。
+
+    LLM 1回の呼び出しでbatch_size件をまとめて分類し、API呼び出し回数を抑える。
+    """
+    categories_str = "\n".join(f"- {c}" for c in UNIFIED_CATEGORIES)
+    results = ["その他"] * len(questions)
+
+    for start in range(0, len(questions), batch_size):
+        batch = questions[start:start + batch_size]
+        questions_text = ""
+        for k, q in enumerate(batch):
+            questions_text += f"{k+1}. {q}\n"
+
+        prompt = f"""あなたは自治体FAQのカテゴリ分類の専門家です。
+以下の質問それぞれについて、最も適切なカテゴリを1つ判定してください。
+
+{questions_text}
+カテゴリ一覧:
+{categories_str}
+
+【出力形式】
+番号とカテゴリ名のみを出力してください。
+1: 住民票・戸籍・届出
+2: 税金
+3: 環境・ごみ"""
+
+        try:
+            from google import genai
+            from google.genai import types
+
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model="gemini-3.1-flash-lite-preview",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=1500,
+                ),
+            )
+
+            for line in response.text.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.match(r'(\d+)\s*[:.：]\s*(.+)', line)
+                if m:
+                    idx = int(m.group(1)) - 1
+                    cat = m.group(2).strip().strip("「」『』\"' ")
+                    if cat not in UNIFIED_CATEGORIES:
+                        for uc in UNIFIED_CATEGORIES:
+                            if uc in cat or cat in uc:
+                                cat = uc
+                                break
+                        else:
+                            cat = "その他"
+                    if 0 <= start + idx < len(results):
+                        results[start + idx] = cat
+
+        except Exception as e:
+            print(f"    [ERROR] バッチ分類失敗: {e}")
+
+    return results
+
+
+def is_mixed_genre_sheet(questions: list[str], sheet_category: str,
+                          sample_size: int = 20) -> bool:
+    """シート内の質問が多ジャンルに分散しているか簡易判定する。
+
+    キーワードベースで質問のジャンルを推定し、シート分類と異なるジャンルの
+    質問が一定割合以上あれば多ジャンル混在と判定する。
+    """
+    # カテゴリごとのキーワード（簡易判定用）
+    CATEGORY_KEYWORDS = {
+        "環境・ごみ": ["ごみ", "リサイクル", "分別", "粗大", "カラス", "ハチ"],
+        "税金": ["固定資産税", "市民税", "住民税", "法人市民税", "納税", "税証明", "確定申告", "課税"],
+        "保険・年金": ["国民健康保険", "国保", "年金", "後期高齢者", "介護保険"],
+        "健康・医療": ["予防接種", "検診", "がん検診", "健康診査", "乳幼児健診"],
+        "福祉・介護": ["介護", "障害", "障がい", "認知症", "高齢者福祉", "生活保護"],
+        "住民票・戸籍・届出": ["住民票", "戸籍", "婚姻届", "離婚届", "出生届", "印鑑登録", "マイナンバーカード"],
+        "防災・消防": ["消防", "救急", "避難", "火災", "AED", "防災"],
+        "住まい・生活": ["水道", "下水道", "建築", "住宅", "道路", "公園"],
+        "子育て・教育": ["保育", "児童", "学童", "幼稚園", "小学校", "就学"],
+        "交通": ["バス", "駐車", "駐輪", "交通安全"],
+        "マイナンバー": ["マイナンバー", "個人番号", "電子証明書"],
+    }
+
+    samples = questions[:min(sample_size, len(questions))]
+    if len(samples) < 5:
+        return False
+
+    matched_categories = []
+    for q in samples:
+        for cat, keywords in CATEGORY_KEYWORDS.items():
+            if any(kw in q for kw in keywords):
+                matched_categories.append(cat)
+                break
+
+    if not matched_categories:
+        return False
+
+    # ジャンルの種類数が多い場合は混在と判定
+    from collections import Counter
+    cat_counts = Counter(matched_categories)
+    n_genres = len(cat_counts)
+    top_genre_ratio = cat_counts.most_common(1)[0][1] / len(matched_categories)
+
+    is_mixed = n_genres >= 4 or (n_genres >= 3 and top_genre_ratio < 0.5)
+    return is_mixed
 
 
 # ============================================================
@@ -248,6 +401,8 @@ def load_all_faq(input_dir: str, api_key: str) -> pd.DataFrame:
     all_rows = []
     skipped_no_question = 0
     skipped_city_specific = 0
+    skipped_invalid = 0
+    reclassified_count = 0
 
     for fpath in files:
         city_name = re.sub(r'FAQ.*$', '', Path(fpath).stem).strip() or Path(fpath).stem
@@ -266,6 +421,20 @@ def load_all_faq(input_dir: str, api_key: str) -> pd.DataFrame:
 
             unified_category = classify_sheet_with_gemini(sheet_name, sample_qs, api_key)
 
+            # --- 問題1対策: 多ジャンル混在シートの検出 ---
+            all_questions_in_sheet = df["質問"].dropna().tolist()
+            use_per_question = False
+            per_question_categories = {}
+
+            if len(all_questions_in_sheet) >= 10:
+                if is_mixed_genre_sheet(all_questions_in_sheet, unified_category):
+                    print(f"  [MIXED] {city_name} / {sheet_name}: "
+                          f"多ジャンル混在を検出 → 質問単位で再分類 ({len(all_questions_in_sheet)}件)")
+                    cats = classify_questions_batch(all_questions_in_sheet, api_key)
+                    per_question_categories = {q: c for q, c in zip(all_questions_in_sheet, cats)}
+                    use_per_question = True
+                    reclassified_count += len(all_questions_in_sheet)
+
             for _, row in df.iterrows():
                 q = str(row.get("質問", "")).strip()
                 a = str(row.get("回答", "")).strip()
@@ -275,14 +444,21 @@ def load_all_faq(input_dir: str, api_key: str) -> pd.DataFrame:
                     skipped_no_question += 1
                     continue
 
+                if is_invalid_question(q):
+                    skipped_invalid += 1
+                    continue
+
                 if is_city_specific(q, city_name):
                     skipped_city_specific += 1
                     continue
 
+                # 質問単位分類が有効ならそちらを使用
+                cat = per_question_categories.get(q, unified_category) if use_per_question else unified_category
+
                 all_rows.append({
                     "自治体": city_name,
                     "元カテゴリ": sheet_name,
-                    "統一カテゴリ": unified_category,
+                    "統一カテゴリ": cat,
                     "サブカテゴリ": sub if sub != "nan" else "",
                     "質問": q,
                     "回答": a,
@@ -294,6 +470,13 @@ def load_all_faq(input_dir: str, api_key: str) -> pd.DataFrame:
         print(f"  無効な質問でスキップ: {skipped_no_question}件")
     if skipped_city_specific:
         print(f"  自治体固有質問で除外: {skipped_city_specific}件")
+    if skipped_invalid:
+        print(f"  無効な質問文で除外: {skipped_invalid}件")
+    if reclassified_count:
+        print(f"  多ジャンル混在シートで質問単位再分類: {reclassified_count}件")
+
+    # --- 問題2対策: テンプレートFAQの検出・削減 ---
+    result = _reduce_template_faqs(result)
 
     print("\nカテゴリ別件数:")
     for cat, cnt in result["統一カテゴリ"].value_counts().items():
@@ -306,6 +489,46 @@ def load_all_faq(input_dir: str, api_key: str) -> pd.DataFrame:
             print(f"    - '{s}'")
 
     return result
+
+
+def _reduce_template_faqs(df: pd.DataFrame,
+                           max_per_group: int = 3,
+                           min_group_size: int = 8) -> pd.DataFrame:
+    """同一自治体・同一サブカテゴリから大量に出ているテンプレートFAQを削減する。
+
+    例: 鎌倉市「こどもの家」36件 → 代表3件に削減
+        日立市「交流センター」4件 → そのまま（8件未満なので対象外）
+
+    Args:
+        df: 全質問DataFrame
+        max_per_group: テンプレートグループから残す最大件数
+        min_group_size: この件数以上のグループをテンプレートとみなす
+    """
+    before = len(df)
+    groups = df.groupby(["自治体", "サブカテゴリ"])
+
+    rows_to_drop = []
+    template_log = []
+
+    for (city, sub), group_df in groups:
+        if not sub or sub == "nan" or sub == "":
+            continue
+        if len(group_df) < min_group_size:
+            continue
+
+        # テンプレートFAQ候補: 同一自治体・同一サブカテゴリにmin_group_size件以上
+        # → 先頭max_per_group件だけ残し、残りを除去
+        excess = group_df.index.tolist()[max_per_group:]
+        rows_to_drop.extend(excess)
+        template_log.append((city, sub, len(group_df), len(excess)))
+
+    if rows_to_drop:
+        df = df.drop(index=rows_to_drop).reset_index(drop=True)
+        print(f"\n  テンプレートFAQ削減: {before}件 → {len(df)}件 ({len(rows_to_drop)}件除去)")
+        for city, sub, total, dropped in template_log:
+            print(f"    {city}/{sub}: {total}件 → {total - dropped}件")
+
+    return df
 
 
 # ============================================================
@@ -329,8 +552,33 @@ def strip_city_names(text: str, city_name: str = "") -> str:
     for cn in sorted(all_names, key=len, reverse=True):
         if cn and cn in text:
             text = text.replace(cn, "")
+    # 広報紙の固有名も汎用化（「広報かまくら」→「広報」、「広報津」→「広報」）
+    text = re.sub(r'(広報)[ぁ-んァ-ン一-鿿]{1,}', r'\1', text)
+    # カギ括弧付きの広報紙名を汎用化（「広報つるおか」→ 広報）
+    text = re.sub(r'[「『]広報[^」』]*[」』]', '広報', text)
+    text = re.sub(r'[「『][^」』]*市[民政][^」』]*[」』]', '広報', text)
+    # 広報紙名パターン（「きょうと市民しんぶん」等）
+    text = re.sub(r'[「『][ぁ-んァ-ン一-鿿]+[しだ][んよ][ぶり][んー][」』]?', '広報', text)
     text = re.sub(r'^[のはがをにへでと、]+', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+# 表記揺れの正規化辞書（Embedding前に適用）
+SYNONYM_MAP = [
+    (r'国保', '国民健康保険'),
+    (r'国民健康保険', '国民健康保険'),  # 統一形を維持
+    (r'マイナンバーカード|マイナカード|個人番号カード', 'マイナンバーカード'),
+    (r'コンビニエンスストア|コンビニ', 'コンビニ'),
+]
+
+
+def normalize_synonyms(text: str) -> str:
+    """表記揺れを統一してEmbedding精度を向上させる"""
+    # 「国保」→「国民健康保険」（ただし「国民健康保険」自体はそのまま）
+    text = re.sub(r'国保(?!険)', '国民健康保険', text)
+    text = re.sub(r'コンビニエンスストア', 'コンビニ', text)
+    text = re.sub(r'マイナカード|個人番号カード', 'マイナンバーカード', text)
     return text
 
 
@@ -440,8 +688,16 @@ def embed_with_gemini(texts: list[str], api_key: str,
 def mmr_select(embeddings, indices,
                lam=DEFAULT_MMR_LAMBDA,
                score_threshold=DEFAULT_MMR_SCORE_THRESHOLD,
-               max_ratio=DEFAULT_MMR_MAX_RATIO):
-    """MMR選出（ベクトル化高速版）"""
+               max_ratio=DEFAULT_MMR_MAX_RATIO,
+               dup_sim_threshold=0.92,
+               cities=None):
+    """MMR選出（改良版: cross-city relevance + 高類似度ペア強制排除）
+
+    Args:
+        dup_sim_threshold: この値以上の類似度を持つ質問は強制排除。
+        cities: 各インデックスに対応する自治体名のリスト。
+                指定時、複数自治体に共通する質問を優先する（cross-city relevance）。
+    """
     if len(indices) <= 1:
         return indices
 
@@ -449,11 +705,37 @@ def mmr_select(embeddings, indices,
     n = len(indices)
     max_select = max(1, int(n * max_ratio))
 
-    # 事前に全ペアの類似度行列を計算（ボトルネック解消）
+    # 事前に全ペアの類似度行列を計算
     sim_matrix = cosine_similarity(sub)  # (n, n)
 
-    centroid = sub.mean(axis=0, keepdims=True)
-    relevance = cosine_similarity(sub, centroid).flatten()  # (n,)
+    # --- relevance計算 ---
+    if cities is not None and len(set(cities)) >= 2:
+        # Cross-City Relevance: 他の自治体の質問との平均最大類似度
+        # 各質問iについて、自治体ごとに最も類似する質問との類似度を求め、
+        # その自治体平均を取ることで「どれだけ多くの自治体で共通する話題か」を測る
+        city_arr = np.array(cities)
+        unique_cities = list(set(cities))
+        relevance = np.zeros(n)
+
+        for i in range(n):
+            my_city = city_arr[i]
+            other_city_max_sims = []
+            for uc in unique_cities:
+                if uc == my_city:
+                    continue
+                mask = city_arr == uc
+                if not np.any(mask):
+                    continue
+                max_sim = sim_matrix[i, mask].max()
+                other_city_max_sims.append(max_sim)
+            if other_city_max_sims:
+                relevance[i] = np.mean(other_city_max_sims)
+            else:
+                relevance[i] = 0.0
+    else:
+        # フォールバック: 従来の重心ベース
+        centroid = sub.mean(axis=0, keepdims=True)
+        relevance = cosine_similarity(sub, centroid).flatten()
 
     selected = []
     remaining = set(range(n))
@@ -464,32 +746,119 @@ def mmr_select(embeddings, indices,
     remaining.discard(first)
 
     # 各候補の「選択済みとの最大類似度」を追跡
-    max_sim_to_selected = sim_matrix[:, first].copy()  # (n,)
+    max_sim_to_selected = sim_matrix[:, first].copy()
 
     remaining_arr = np.array(list(remaining))
 
     while len(remaining) > 0 and len(selected) < max_select:
-        # ベクトル化でMMRスコアを一括計算
         r_idx = remaining_arr
+
+        # 強制排除: 選択済みとの最大類似度が閾値以上の候補を除外
+        not_dup_mask = max_sim_to_selected[r_idx] < dup_sim_threshold
+        if not np.any(not_dup_mask):
+            break
+
         scores = lam * relevance[r_idx] - (1 - lam) * max_sim_to_selected[r_idx]
+        scores[~not_dup_mask] = -np.inf
 
         best_pos = int(np.argmax(scores))
         best_score = scores[best_pos]
 
-        if best_score < score_threshold:
+        if best_score < score_threshold or best_score == -np.inf:
             break
 
         best_idx = r_idx[best_pos]
         selected.append(int(best_idx))
         remaining.discard(int(best_idx))
 
-        # remaining_arrを更新（選択されたものを除去）
         remaining_arr = np.delete(remaining_arr, best_pos)
-
-        # 新しく選択されたものとの類似度でmax_sim_to_selectedを更新
         np.maximum(max_sim_to_selected, sim_matrix[:, best_idx], out=max_sim_to_selected)
 
     return [indices[i] for i in selected]
+
+
+# ============================================================
+# ⑤ 地域固有質問の最終フィルタ（LLMベース）
+# ============================================================
+def _filter_region_specific(df: pd.DataFrame, api_key: str,
+                             batch_size: int = 40) -> tuple[pd.DataFrame, int]:
+    """MMR選出後の質問に対し、LLMで地域固有質問を判定して除去する。
+
+    「質問文中に特定の地名・施設固有名・路線固有名が含まれているか」のみを判定。
+    質問の内容やテーマで判定するのではなく、固有名詞の有無で判定する。
+    """
+    questions = df["質問"].tolist()
+
+    is_regional = [False] * len(questions)
+
+    for start in range(0, len(questions), batch_size):
+        batch_qs = questions[start:start + batch_size]
+
+        questions_text = ""
+        for k, q in enumerate(batch_qs):
+            questions_text += f"{k+1}. {q}\n"
+
+        prompt = f"""あなたは日本語テキストから固有名詞を検出する専門家です。
+以下の自治体FAQ質問リストの中から、**質問文中にその地域でしか通じない固有名詞**が含まれているものだけを選んでください。
+
+{questions_text}
+【「地域固有」と判定する条件 — 以下のいずれかに該当する場合のみ】
+① 特定の地名・地区名・通り名が含まれる（例: 「須磨海水浴場」「都祁行政センター」「八条・大安寺周辺地区」）
+② 特定の鉄道路線名・有料道路名が含まれる（例: 「西神・山手線」「六甲有料道路」「宇都宮LRT」「ゆいレール」）
+③ 特定の施設の固有名が含まれる（例: 「こども本の森 神戸」「シルバーカレッジ」「UNITY」）
+④ 特定の地域だけの固有制度名・イベント名が含まれる（例: 「認知症神戸モデル」「灘の酒蔵謎解き探訪」「ワケトンカレンダー」）
+⑤ 特定の県名が含まれる（例: 「奈良県自転車条例」「兵庫県収入証紙」）
+
+【「汎用」と判定する（＝除外しない）もの — 非常に重要】
+- 質問のテーマが一般的であれば、出典の自治体に関係なく「汎用」です
+- 以下はすべて「汎用」です。絶対に地域固有と判定しないでください:
+  ・全国共通の制度: 児童手当、国民健康保険、介護保険、生活保護、住民票、戸籍、固定資産税、粗大ごみ、etc.
+  ・どの自治体にもある質問: ごみの分別方法、転入転出の手続き、証明書の取得方法、防災訓練、ハザードマップ、etc.
+  ・一般的な行政サービス: 図書館、保育所、学童保育、市営住宅、消防署見学、パブリックコメント、etc.
+  ・一般的な社会問題: DV相談、野良猫対策、空き家対策、騒音問題、不審者対応、etc.
+- 「どこで」「いつ」「いくら」等を聞いていても、質問自体はどの自治体でも成り立つなら「汎用」です
+
+【出力形式】
+地域固有と判定した質問の番号のみをカンマ区切りで出力してください。
+1件もなければ「なし」と出力してください。"""
+
+        try:
+            from google import genai
+            from google.genai import types
+
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model="gemini-3.1-flash-lite-preview",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=500,
+                ),
+            )
+
+            text = response.text.strip()
+            if text != "なし" and text != "該当なし":
+                for num_str in re.findall(r'\d+', text):
+                    idx = int(num_str) - 1
+                    if 0 <= idx < len(batch_qs):
+                        is_regional[start + idx] = True
+
+        except Exception as e:
+            print(f"    [ERROR] バッチ判定失敗: {e}")
+
+        import time
+        time.sleep(1)
+
+    # 地域固有と判定された質問を除去
+    removed_indices = [i for i, flag in enumerate(is_regional) if flag]
+    if removed_indices:
+        removed_qs = df.iloc[removed_indices]
+        print(f"  地域固有と判定: {len(removed_indices)}件")
+        for _, row in removed_qs.iterrows():
+            print(f"    除去: [{row['統一カテゴリ']}] {row['質問'][:60]} ({row['自治体']})")
+        df = df.drop(index=removed_indices).reset_index(drop=True)
+
+    return df, len(removed_indices)
 
 
 # ============================================================
@@ -587,6 +956,12 @@ def main():
                         help=f"カテゴリあたり最大選出比率 (default: {DEFAULT_MMR_MAX_RATIO})")
     parser.add_argument("--threshold", type=float, default=DEFAULT_MMR_SCORE_THRESHOLD,
                         help=f"MMR打ち切り閾値 (default: {DEFAULT_MMR_SCORE_THRESHOLD})")
+    parser.add_argument("--dup-threshold", type=float, default=0.92,
+                        help="MMR内の重複排除類似度閾値 (default: 0.92)")
+    parser.add_argument("--intra-threshold", type=float, default=0.85,
+                        help="STEP4-2 同カテゴリ内LLM重複判定の類似度閾値 (default: 0.85)")
+    parser.add_argument("--cross-threshold", type=float, default=0.87,
+                        help="STEP4-2 カテゴリ間LLM重複判定の類似度閾値 (default: 0.87)")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"APIバッチサイズ (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT,
@@ -604,7 +979,9 @@ def main():
     print(f"  入力: {args.input}")
     print(f"  出力: {args.output}")
     print(f"  MMR: λ={args.mmr_lambda}, 最大比率={args.max_ratio}, "
-          f"閾値={args.threshold}")
+          f"閾値={args.threshold}, 重複閾値={args.dup_threshold}")
+    print(f"  STEP4-2: 同カテゴリ内≥{args.intra_threshold}, "
+          f"カテゴリ間≥{args.cross_threshold}")
     print(f"  API: バッチ={args.batch_size}, 並列={args.max_concurrent}")
     print("=" * 60)
 
@@ -622,7 +999,9 @@ def main():
 
     # Embedding用: 自治体名を除去（「広報○○市」→「広報」で統一）
     df["質問_embed"] = df.apply(
-        lambda row: strip_city_names(row["質問_clean"], row.get("自治体", "")),
+        lambda row: normalize_synonyms(
+            strip_city_names(row["質問_clean"], row.get("自治体", ""))
+        ),
         axis=1,
     )
     n_changed = len(df[df["質問_clean"] != df["質問_embed"]])
@@ -644,17 +1023,21 @@ def main():
         max_concurrent=args.max_concurrent,
     )
 
-    # ④ MMR
-    print("\n【STEP 4】MMRによる代表質問選出")
+    # ④ MMR（Cross-City Relevance: 複数自治体に共通する質問を優先）
+    print("\n【STEP 4】MMRによる代表質問選出（cross-city relevance）")
     stats, selected_indices = {}, []
     for cat in sorted(df["統一カテゴリ"].unique()):
         idxs = df[df["統一カテゴリ"] == cat].index.tolist()
         if not idxs:
             continue
+        # カテゴリ内の各質問の出典自治体リストを取得
+        cat_cities = df.loc[idxs, "自治体"].tolist()
         sel = mmr_select(embeddings, idxs,
                          lam=args.mmr_lambda,
                          score_threshold=args.threshold,
-                         max_ratio=args.max_ratio)
+                         max_ratio=args.max_ratio,
+                         dup_sim_threshold=args.dup_threshold,
+                         cities=cat_cities)
         selected_indices.extend(sel)
         stats[cat] = {"before": len(idxs), "after": len(sel)}
         print(f"  {cat}: {len(idxs)}件 → {len(sel)}件")
@@ -665,56 +1048,178 @@ def main():
     print(f"\n合計: {total_before}件 → {total_after}件"
           f"（{total_after/total_before*100:.1f}%）")
 
-    # ④-2 カテゴリ間の重複除去
-    print("\n【STEP 4-2】カテゴリ間の重複質問を除去")
+    # ④-2 全体の重複除去（同カテゴリ内 + カテゴリ間、コサイン類似度 + LLM判定）
+    print("\n【STEP 4-2】残存する重複質問を除去（同カテゴリ内 + カテゴリ間、LLMハイブリッド方式）")
     sim = cosine_similarity(result_emb)
     np.fill_diagonal(sim, 0)
 
-    removed = set()
-    cross_dup_log = []
-    CROSS_DEDUP_THRESHOLD = 0.95
-
+    # Phase 1: コサイン類似度が高い候補ペアを抽出（同カテゴリ内も対象に）
+    INTRA_THRESHOLD = args.intra_threshold   # 同カテゴリ内: MMRで漏れた重複を捕捉
+    CROSS_THRESHOLD = args.cross_threshold   # カテゴリ間
+    candidates = []
     for i in range(len(result)):
-        if i in removed:
-            continue
         for j in range(i + 1, len(result)):
-            if j in removed:
+            same_cat = result.iloc[i]["統一カテゴリ"] == result.iloc[j]["統一カテゴリ"]
+            threshold = INTRA_THRESHOLD if same_cat else CROSS_THRESHOLD
+            if sim[i, j] >= threshold:
+                candidates.append((i, j, sim[i, j]))
+
+    print(f"  候補ペア: {len(candidates)}件（同カテゴリ内≥{INTRA_THRESHOLD}, カテゴリ間≥{CROSS_THRESHOLD}）")
+
+    if not candidates:
+        print("  カテゴリ間の重複候補なし")
+    else:
+        # Phase 2: LLMで非同期並列バッチ判定
+        import aiohttp
+
+        LLM_BATCH_SIZE = 50
+        MAX_CONCURRENT = 5
+        LLM_MODEL = "gemini-3.1-flash-lite-preview"
+
+        llm_results = {}  # (i, j) -> True(統合可能) / False(別質問)
+
+        # バッチごとのプロンプトを事前生成
+        batches = []
+        for batch_start in range(0, len(candidates), LLM_BATCH_SIZE):
+            batch = candidates[batch_start:batch_start + LLM_BATCH_SIZE]
+            pairs_text = ""
+            for k, (i, j, s) in enumerate(batch):
+                same_cat_flag = "【同カテゴリ】" if result.iloc[i]['統一カテゴリ'] == result.iloc[j]['統一カテゴリ'] else ""
+                pairs_text += (
+                    f"ペア{k+1}: {same_cat_flag}\n"
+                    f"  A[{result.iloc[i]['統一カテゴリ']}]: {result.iloc[i]['質問']}\n"
+                    f"  B[{result.iloc[j]['統一カテゴリ']}]: {result.iloc[j]['質問']}\n\n"
+                )
+            prompt = f"""あなたは自治体FAQの重複チェックの専門家です。
+以下のペアそれぞれについて、2つの質問が「同じ回答で対応できる重複質問」か「別々の回答が必要な別質問」かを判定してください。
+
+{pairs_text}
+【判定基準】
+- 問い合わせ内容が実質的に同じで、同じ回答で対応できる → 「統合」
+- 言い回しが違うだけで聞いていることが同じ → 「統合」
+  例: 「職場の保険に入ったので国保を辞めたい」と「就職したので国民健康保険をやめる手続きは」→ 統合
+  例: 「粗大ごみの出し方」と「大型ごみの処分方法」→ 統合
+  例: 「広報○○が届かない」と「広報△△が届かない」→ 統合（自治体名が違うだけ）
+- サブトピックや対象者が異なり、別の回答が必要 → 「別」
+  例: 「国民健康保険の加入手続き」と「国民健康保険料の納付方法」→ 別
+  例: 「介護認定の申請先」と「介護保険料の計算方法」→ 別
+
+【出力形式】
+ペアごとに「番号: 統合 または 別」のみを出力してください。
+1: 統合
+2: 別
+3: 統合"""
+            batches.append((batch, prompt))
+
+        print(f"  LLMバッチ数: {len(batches)}（バッチサイズ{LLM_BATCH_SIZE}, 並列{MAX_CONCURRENT}）")
+
+        async def _run_llm_dedup():
+            sem = asyncio.Semaphore(MAX_CONCURRENT)
+            completed = [0]
+
+            async def process_one(session, batch, prompt, batch_id):
+                url = (f"https://generativelanguage.googleapis.com/v1beta/"
+                       f"models/{LLM_MODEL}:generateContent?key={api_key}")
+                body = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.0,
+                        "maxOutputTokens": 1000,
+                    }
+                }
+                async with sem:
+                    for attempt in range(3):
+                        try:
+                            async with session.post(url, json=body) as resp:
+                                if resp.status == 429:
+                                    await asyncio.sleep(2 ** attempt)
+                                    continue
+                                data = await resp.json()
+                                text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+                                for line in text.strip().split("\n"):
+                                    line = line.strip()
+                                    if not line:
+                                        continue
+                                    m = re.match(r'(\d+)\s*[:.：]\s*(統合|別)', line)
+                                    if m:
+                                        idx = int(m.group(1)) - 1
+                                        if 0 <= idx < len(batch):
+                                            i, j, s = batch[idx]
+                                            llm_results[(i, j)] = (m.group(2) == "統合")
+                                break
+                        except Exception as e:
+                            if attempt == 2:
+                                print(f"  [ERROR] バッチ{batch_id}: {e}")
+                                for i, j, s in batch:
+                                    llm_results[(i, j)] = (s >= 0.95)
+                            else:
+                                await asyncio.sleep(1)
+
+                    completed[0] += 1
+                    if completed[0] % 5 == 0 or completed[0] == len(batches):
+                        print(f"  LLM判定: {completed[0]}/{len(batches)}バッチ完了")
+
+            async with aiohttp.ClientSession() as session:
+                tasks = [process_one(session, b, p, idx)
+                         for idx, (b, p) in enumerate(batches)]
+                await asyncio.gather(*tasks)
+
+        asyncio.run(_run_llm_dedup())
+
+        # Phase 3: LLMが「統合」と判断したペアを除去
+        removed = set()
+        cross_dup_log = []
+
+        # 類似度が高い順にソートして処理
+        for i, j, s in sorted(candidates, key=lambda x: -x[2]):
+            if i in removed or j in removed:
                 continue
-            # 同じカテゴリ内はMMRで処理済みなのでスキップ
-            if result.iloc[i]["統一カテゴリ"] == result.iloc[j]["統一カテゴリ"]:
-                continue
-            if sim[i, j] >= CROSS_DEDUP_THRESHOLD:
+            is_dup = llm_results.get((i, j), False)
+            if is_dup:
                 removed.add(j)
                 cross_dup_log.append((
                     result.iloc[j]["質問"][:50],
                     result.iloc[j]["統一カテゴリ"],
                     result.iloc[i]["質問"][:50],
                     result.iloc[i]["統一カテゴリ"],
-                    sim[i, j],
+                    s,
                 ))
 
-    if cross_dup_log:
-        print(f"  {len(cross_dup_log)}件の重複を除去（閾値={CROSS_DEDUP_THRESHOLD}）:")
-        for q_rm, cat_rm, q_kp, cat_kp, s in cross_dup_log[:10]:
-            print(f"    除去: [{cat_rm}] {q_rm}")
-            print(f"    残す: [{cat_kp}] {q_kp} (類似度={s:.3f})")
-        if len(cross_dup_log) > 10:
-            print(f"    ... 他{len(cross_dup_log) - 10}件")
+        if cross_dup_log:
+            intra = sum(1 for _, cat_rm, _, cat_kp, _ in cross_dup_log if cat_rm == cat_kp)
+            cross = len(cross_dup_log) - intra
+            print(f"\n  LLM判定で{len(cross_dup_log)}件の重複を除去（同カテゴリ内: {intra}件, カテゴリ間: {cross}件）:")
+            for q_rm, cat_rm, q_kp, cat_kp, s in cross_dup_log[:15]:
+                print(f"    除去: [{cat_rm}] {q_rm}")
+                print(f"    残す: [{cat_kp}] {q_kp} (類似度={s:.3f})")
+            if len(cross_dup_log) > 15:
+                print(f"    ... 他{len(cross_dup_log) - 15}件")
 
-        keep_mask = [i for i in range(len(result)) if i not in removed]
-        result = result.iloc[keep_mask].reset_index(drop=True)
+            keep_mask = [i for i in range(len(result)) if i not in removed]
+            result = result.iloc[keep_mask].reset_index(drop=True)
 
-        # statsを更新
+            for cat in stats:
+                stats[cat]["after"] = len(result[result["統一カテゴリ"] == cat])
+
+            print(f"  {total_after}件 → {len(result)}件")
+            total_after = len(result)
+        else:
+            print("  LLM判定で重複なし")
+
+    # ⑤ 地域固有質問の最終フィルタ（LLMで汎用性を判定）
+    print("\n【STEP 5】地域固有質問の除去（LLM汎用性判定）")
+    result, n_removed = _filter_region_specific(result, api_key)
+    if n_removed > 0:
         for cat in stats:
             stats[cat]["after"] = len(result[result["統一カテゴリ"] == cat])
-
-        print(f"  {total_after}件 → {len(result)}件")
         total_after = len(result)
+        print(f"  → {n_removed}件除去、残り{total_after}件")
     else:
-        print("  カテゴリ間の重複なし")
+        print("  地域固有質問なし")
 
-    # ⑤ 出力
-    print("\n【STEP 5】Excel出力")
+    # ⑥ 出力
+    print("\n【STEP 6】Excel出力")
     save_to_excel(result, stats, args.output)
 
     print("\n" + "=" * 60)
